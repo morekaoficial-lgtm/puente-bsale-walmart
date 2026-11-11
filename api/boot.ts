@@ -8,8 +8,33 @@ import { env } from "./lib/env";
 import { log } from "./lib/logger";
 import { handleClientLog } from "./lib/clientlog";
 import { REQUEST_ID_HEADER, runWithRequestId } from "./lib/requestcontext";
+import { startScheduler } from "./integration/scheduler";
 
 const app = new Hono<{ Bindings: HttpBindings }>();
+
+// En un Droplet, toda la aplicación queda detrás de autenticación básica.
+// Debe publicarse únicamente mediante HTTPS para proteger estas credenciales.
+app.use("*", async (c, next) => {
+  if (process.env.SELF_HOSTED !== "true") return next();
+  const expectedUser = process.env.DASHBOARD_USER || "admin";
+  const expectedPassword = process.env.DASHBOARD_PASSWORD || "";
+  const authorization = c.req.header("Authorization") || "";
+  let authenticated = false;
+  if (expectedPassword && authorization.startsWith("Basic ")) {
+    try {
+      const decoded = Buffer.from(authorization.slice(6), "base64").toString("utf8");
+      const separator = decoded.indexOf(":");
+      authenticated = decoded.slice(0, separator) === expectedUser && decoded.slice(separator + 1) === expectedPassword;
+    } catch {
+      authenticated = false;
+    }
+  }
+  if (!authenticated) {
+    c.header("WWW-Authenticate", 'Basic realm="Puente Bsale Walmart", charset="UTF-8"');
+    return c.text("Acceso restringido", 401);
+  }
+  return next();
+});
 
 // One middleware for both halves of request observability, because they need the
 // same scope and the same id:
@@ -95,6 +120,7 @@ export default app;
 if (env.isProduction) {
   const { serve } = await import("@hono/node-server");
   const { serveStaticFiles } = await import("./lib/vite");
+  startScheduler();
   serveStaticFiles(app);
 
   const port = parseInt(process.env.PORT || "3000");
