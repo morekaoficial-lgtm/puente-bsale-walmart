@@ -26,11 +26,10 @@ dist-ssr
 .env
 .env.local
 .env.*.local
-# Database
+# Local database files (Docker migrations must remain versioned)
 *.db
 *.sqlite
 *.sqlite3
-db/migrations/*.sql
 # TypeScript cache
 *.tsbuildinfo
 # Build outputs
