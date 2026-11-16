@@ -25,6 +25,11 @@ describe("Walmart Marketplace", () => {
 
     expect(calls).toHaveLength(2);
     expect(calls[0].url).toBe("https://sandbox.walmartapis.com/v3/token");
+    const tokenHeaders = calls[0].init?.headers as Record<string, string>;
+    expect(tokenHeaders.Authorization).toMatch(/^Basic /);
+    expect(tokenHeaders["WM_SVC.NAME"]).toBe("Walmart Marketplace");
+    expect(tokenHeaders["WM_QOS.CORRELATION_ID"]).toBeTruthy();
+    expect(tokenHeaders["WM_MARKET"]).toBe("mx");
     expect(calls[1].url).toContain("https://sandbox.walmartapis.com/v3/inventory?");
     expect(calls[1].url).toContain("sku=SKU-1");
     expect(calls[1].url).toContain("shipNode=NODE-1");

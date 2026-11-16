@@ -26,13 +26,18 @@ async function getAccessToken(mode: Exclude<SyncMode, "simulation">): Promise<st
     throw new Error("Configura WALMART_CLIENT_ID y WALMART_CLIENT_SECRET en el servidor");
   }
   const basic = Buffer.from(`${config.walmartClientId}:${config.walmartClientSecret}`).toString("base64");
+  const headers: Record<string, string> = {
+    Authorization: `Basic ${basic}`,
+    Accept: "application/json",
+    "Content-Type": "application/x-www-form-urlencoded",
+    "WM_SVC.NAME": "Walmart Marketplace",
+    "WM_QOS.CORRELATION_ID": crypto.randomUUID(),
+    "WM_MARKET": config.walmartMarket,
+  };
+  if (config.walmartChannelType) headers["WM_CONSUMER.CHANNEL.TYPE"] = config.walmartChannelType;
   const response = await fetch(`${baseUrl(mode)}/v3/token`, {
     method: "POST",
-    headers: {
-      Authorization: `Basic ${basic}`,
-      Accept: "application/json",
-      "Content-Type": "application/x-www-form-urlencoded",
-    },
+    headers,
     body: "grant_type=client_credentials",
     signal: AbortSignal.timeout(20_000),
   });
