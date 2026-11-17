@@ -177,7 +177,9 @@ export default function Home() {
               <div className="metric-block">
                 <span className="metric-label">Con cambios</span>
                 <strong className="metric-value text-[#78dcca]">{latest ? number(latest.updated) : "—"}</strong>
-                <span className="metric-meta">{latest?.mode === "simulation" ? "Calculados, no enviados" : "Actualizados en Walmart"}</span>
+                <span className="metric-meta">
+                  {latest?.mode === "simulation" ? "Calculados, no enviados" : `${number(latest?.unchanged)} sin cambios`}
+                </span>
               </div>
               <div className="metric-block">
                 <span className="metric-label">Fallos</span>
@@ -341,7 +343,8 @@ export default function Home() {
               <div className="side-heading"><ShieldCheck className="size-4" /><h2>Protecciones</h2></div>
               <ul className="protection-list">
                 <li>Sin escrituras en modo simulación</li>
-                <li>Producción limitada a un SKU confirmado</li>
+                <li>Producción siempre requiere confirmación</li>
+                <li>Solo se envían cantidades diferentes</li>
                 <li>Credenciales fuera de la base de datos</li>
                 <li>Una sola ejecución a la vez</li>
               </ul>
@@ -362,7 +365,7 @@ export default function Home() {
           <div className="rounded-md bg-[#110e10] p-4">
             <p className="whitespace-pre-wrap break-words font-mono text-sm leading-6 text-[#e7dadc]">{selectedItem?.errorMessage}</p>
           </div>
-          {selectedItem?.correlationId && <p className="break-all font-mono text-xs text-[#aaaab6]">Correlation ID: {selectedItem.correlationId}</p>}
+          {selectedItem?.correlationId && <p className="break-all font-mono text-xs text-[#aaaab6]">Referencia Walmart: {selectedItem.correlationId}</p>}
           <p className="text-sm leading-6 text-[#aaaab6]">Corrige la causa y usa “Reintentar fallidos” para crear una nueva ejecución sin repetir los SKU correctos.</p>
         </DialogContent>
       </Dialog>

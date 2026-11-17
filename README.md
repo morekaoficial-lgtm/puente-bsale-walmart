@@ -6,12 +6,14 @@ Aplicación web para sincronizar inventario desde Bsale hacia Walmart Marketplac
 
 - Lectura paginada de `GET /v1/stocks.json` de Bsale, con `quantityAvailable` por variante y sucursal.
 - Correspondencia directa entre el código de variante de Bsale y el SKU de Walmart.
-- Consulta de `GET /v3/inventory` y actualización de `PUT /v3/inventory` en Walmart.
+- Consulta individual de `GET /v3/inventory` y actualización puntual con `PUT /v3/inventory`.
+- Para catálogos: lectura paginada de `GET /v3/inventories`, comparación en memoria y envío de solo las diferencias mediante `POST /v3/feeds?feedType=inventory`.
 - Autenticación OAuth 2.0 de Walmart con renovación automática del token de corta duración.
 - Stock de seguridad, filtro de catálogo, sucursal y ship node configurables.
 - Ejecuciones manuales, programadas y reintentos de SKU fallidos.
 - Historial persistente de cantidades, errores HTTP y correlation ID.
-- Simulación sin llamadas de escritura, sandbox y producción limitada a un SKU confirmado.
+- Simulación sin llamadas de escritura, sandbox y producción con confirmación explícita para un SKU o el catálogo permitido.
+- Reintentos acotados para HTTP 408, 429 y errores transitorios de Walmart, con espera exponencial y soporte de `Retry-After`.
 - Acceso al panel mediante usuario y contraseña cuando se instala en el Droplet.
 - Base de datos MySQL exclusiva y sincronización programada desactivada por defecto.
 
@@ -30,6 +32,18 @@ Referencias oficiales:
 - [Walmart Inventory API](https://developer.walmart.com/global-marketplace/lang-es/docs/inventory-api-overview)
 - [Walmart Token API](https://developer.walmart.com/global-marketplace/docs/get-an-access-token-using-token-api)
 - [Actualizar inventario](https://developer.walmart.com/global-marketplace/lang-es/reference/updateinventoryforanitem)
+- [Actualización masiva de inventario](https://developer.walmart.com/us-marketplace/docs/bulk-inventory)
+
+## Funcionamiento con más de mil SKU
+
+1. Bsale se lee una sola vez por páginas y se calcula `max(0, floor(quantityAvailable - safetyStock))` para cada variante.
+2. Walmart se lee con `GET /v3/inventories?limit=50`, siguiendo `nextCursor` secuencialmente hasta terminar el catálogo.
+3. Se comparan las cantidades en memoria. Los SKU iguales se guardan como `unchanged` y no generan ninguna escritura.
+4. Solo las diferencias se incluyen en un feed JSON 1.4. Un SKU ausente, una cantidad inválida o un nodo ambiguo se registran como fallo y no se inventa un stock inicial.
+5. Walmart devuelve un `feedId` y procesa el lote de forma asíncrona. El estado “Cambio enviado” confirma la aceptación del feed, no que cada línea ya haya terminado; la siguiente ejecución vuelve a comparar el inventario real.
+6. Si no hay diferencias, no se crea ningún feed. Si hay varios ship nodes, configura el correcto en el panel antes de ejecutar el catálogo.
+
+La lista permitida debe contener primero entre 20 y 50 SKU para el piloto. Déjala vacía únicamente después de revisar esos resultados en Seller Center.
 
 ## Instalación aislada en DigitalOcean
 
@@ -52,11 +66,13 @@ Requisitos: Docker Engine y el plugin Docker Compose v2. No es necesario detener
    docker compose config -q
    ```
 
-5. Construye e inicia solamente este proyecto:
+5. Descarga la imagen construida por GitHub Actions e inicia solamente este proyecto, sin compilar en el Droplet:
 
    ```bash
-   docker compose up -d --build
-   docker compose ps
+   docker pull ghcr.io/morekaoficial-lgtm/puente-bsale-walmart:latest
+   docker tag ghcr.io/morekaoficial-lgtm/puente-bsale-walmart:latest puente-bsale-walmart-app:latest
+   docker compose -p puente-bsale-walmart up -d --no-build app
+   docker compose -p puente-bsale-walmart ps
    ```
 
 6. Revisa los registros sin detener el servicio. Sal de los registros con `Ctrl+C`; eso no detiene los contenedores:
@@ -99,6 +115,8 @@ Para asignarle posteriormente un dominio y HTTPS, agrega una ubicación nueva en
 
    Vuelve a crear solo el contenedor de la aplicación con el comando del paso 2. Después selecciona **Producción**, escribe un SKU y confirma exactamente `ACTUALIZAR TU-SKU`.
 7. Compara el resultado en Seller Center antes de ampliar el catálogo. La programación debe permanecer pausada hasta completar esta validación.
+8. Para el piloto por lotes, deja entre 20 y 50 SKU en **Catálogo permitido**, selecciona **Producción** sin escribir un SKU y confirma exactamente `ACTUALIZAR CATÁLOGO`. Revisa los contadores de cambios enviados, sin cambios y fallos.
+9. Después de verificar el piloto en Seller Center, amplía gradualmente la lista. Para incluir toda la sucursal, deja la lista vacía y vuelve a confirmar `ACTUALIZAR CATÁLOGO`.
 
 ## Sincronización automática
 
@@ -114,7 +132,7 @@ No actives `production` para todo el catálogo sin antes configurar una lista de
 
 - Ver estado: `docker compose ps`
 - Ver registros: `docker compose logs --tail=200 app`
-- Actualizar solo la aplicación: `docker compose up -d --build app`
+- Actualizar solo la aplicación con la imagen remota: `docker compose -p puente-bsale-walmart up -d --no-build --force-recreate app`
 - Detener únicamente esta integración: `docker compose down`
 
 `docker compose down` conserva el volumen `puente_bsale_walmart_mysql_data`, por lo que el historial permanece. No uses `down -v` ni comandos de limpieza general de Docker si quieres conservar datos o recursos de otros proyectos.

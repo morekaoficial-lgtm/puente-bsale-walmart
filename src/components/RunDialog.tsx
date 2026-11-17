@@ -73,21 +73,22 @@ export function RunDialog({
             >
               <option value="simulation">Simulación · no escribe en Walmart</option>
               <option value="sandbox">Sandbox · escribe solo en pruebas</option>
-              <option value="production">Producción · un SKU real</option>
+              <option value="production">Producción · SKU o catálogo permitido</option>
             </select>
           </div>
 
           <div className="space-y-2">
-            <Label htmlFor="run-sku">SKU {mode === "production" ? "obligatorio" : "opcional"}</Label>
+            <Label htmlFor="run-sku">SKU opcional</Label>
             <Input
               id="run-sku"
               value={sku}
               onChange={(event) => setSku(event.target.value)}
               placeholder={mode === "simulation" ? "DEMO-CAFE-500" : "SKU exacto en Bsale y Walmart"}
               className="field-control font-mono"
-              required={mode === "production"}
             />
-            <p className="field-help">Si lo dejas vacío, se procesa el catálogo permitido en la configuración.</p>
+            <p className="field-help">
+              Si lo dejas vacío, se procesa el catálogo permitido en la configuración. Un catálogo real se consulta por páginas y solo envía las diferencias en un feed.
+            </p>
           </div>
 
           {mode === "production" && (
@@ -95,7 +96,8 @@ export function RunDialog({
               <div className="flex gap-3 text-[#f2c45c]">
                 <ShieldAlert className="mt-0.5 size-5 shrink-0" aria-hidden="true" />
                 <p className="text-sm leading-6">
-                  Esta acción modifica inventario real. Escribe <strong>ACTUALIZAR {sku || "<SKU>"}</strong> para confirmar.
+                  Esta acción modifica inventario real. Escribe <strong>{sku.trim() ? `ACTUALIZAR ${sku.trim()}` : "ACTUALIZAR CATÁLOGO"}</strong> para confirmar.
+                  {!sku.trim() && " Se procesará únicamente la lista permitida; si está vacía, se incluirá toda la sucursal."}
                 </p>
               </div>
               <Input

@@ -1,12 +1,117 @@
 import { desc, eq } from "drizzle-orm";
 import { getDb } from "../queries/connection";
-import { integrationSettings, syncItems, syncRuns } from "@db/schema";
-import { getBsaleStocks } from "./bsale";
+import { integrationSettings, syncItems, syncRuns, type IntegrationSettings } from "@db/schema";
+import { getBsaleStocks, type BsaleStock } from "./bsale";
 import { getIntegrationConfig, type SyncMode } from "./config";
-import { calculateTargetStock, parseSkuAllowlist, safeErrorMessage, skuMatches } from "./inventory";
-import { demoWalmartAmount, getWalmartInventory, updateWalmartInventory } from "./walmart";
+import { calculateTargetStock, parseSkuAllowlist, planBulkInventory, safeErrorMessage, skuMatches } from "./inventory";
+import {
+  demoWalmartAmount,
+  getWalmartInventory,
+  getWalmartInventoryCatalog,
+  updateWalmartInventory,
+  updateWalmartInventoryBulk,
+} from "./walmart";
 
 let syncInProgress = false;
+
+type Counters = { total: number; updated: number; unchanged: number; failed: number };
+type SyncItemInsert = typeof syncItems.$inferInsert;
+type Db = ReturnType<typeof getDb>;
+
+async function insertItems(db: Db, items: SyncItemInsert[]) {
+  for (let offset = 0; offset < items.length; offset += 200) {
+    await db.insert(syncItems).values(items.slice(offset, offset + 200));
+  }
+}
+
+async function executeBulkSync({
+  mode,
+  selected,
+  settings,
+  runId,
+  counters,
+  db,
+}: {
+  mode: Exclude<SyncMode, "simulation">;
+  selected: BsaleStock[];
+  settings: IntegrationSettings;
+  runId: number;
+  counters: Counters;
+  db: Db;
+}): Promise<string> {
+  const shipNode = settings.walmartShipNode || undefined;
+  const catalog = await getWalmartInventoryCatalog(mode);
+  const plans = planBulkInventory(selected, catalog, settings.safetyStock, shipNode);
+  counters.total = plans.length;
+
+  const unchanged = plans.filter((plan) => plan.status === "unchanged");
+  const changes = plans.filter((plan) => plan.status === "pending");
+  const failures = plans.filter((plan) => plan.status === "failed");
+  counters.unchanged = unchanged.length;
+  counters.failed = failures.length;
+
+  await insertItems(
+    db,
+    plans
+      .filter((plan) => plan.status !== "pending")
+      .map((plan) => ({
+        runId,
+        sku: plan.stock.sku,
+        bsaleStock: plan.stock.available,
+        walmartStock: plan.walmartStock,
+        targetStock: plan.targetStock,
+        status: plan.status as "unchanged" | "failed",
+        errorCode: plan.errorCode,
+        errorMessage: plan.errorMessage,
+      })),
+  );
+
+  if (changes.length === 0) {
+    return counters.failed === 0
+      ? `Sin escrituras: ${counters.unchanged} SKU ya coinciden entre Bsale y Walmart.`
+      : `No hay diferencias que enviar; ${counters.failed} SKU requieren revisión.`;
+  }
+
+  try {
+    const feed = await updateWalmartInventoryBulk(
+      mode,
+      changes.map((plan) => ({ sku: plan.stock.sku, amount: plan.targetStock })),
+      shipNode,
+    );
+    counters.updated = changes.length;
+    await insertItems(
+      db,
+      changes.map((plan) => ({
+        runId,
+        sku: plan.stock.sku,
+        bsaleStock: plan.stock.available,
+        walmartStock: plan.walmartStock,
+        targetStock: plan.targetStock,
+        status: "updated",
+        correlationId: feed.feedId,
+      })),
+    );
+    return `Feed ${feed.feedId} aceptado por Walmart: ${changes.length} cambio(s) enviados, ${counters.unchanged} sin cambios y ${counters.failed} fallidos.`;
+  } catch (error) {
+    counters.failed += changes.length;
+    const typedError = error as { code?: string; status?: number; correlationId?: string };
+    await insertItems(
+      db,
+      changes.map((plan) => ({
+        runId,
+        sku: plan.stock.sku,
+        bsaleStock: plan.stock.available,
+        walmartStock: plan.walmartStock,
+        targetStock: plan.targetStock,
+        status: "failed",
+        errorCode: typedError.code || (typedError.status ? `HTTP_${typedError.status}` : "WALMART_FEED_ERROR"),
+        errorMessage: safeErrorMessage(error),
+        correlationId: typedError.correlationId,
+      })),
+    );
+    return `Walmart rechazó el lote de ${changes.length} cambio(s); no se confirmó ninguna actualización del feed.`;
+  }
+}
 
 export async function getSettings() {
   const db = getDb();
@@ -31,7 +136,7 @@ export async function executeSync(input: ExecuteSyncInput) {
   if (input.mode === "production") {
     if (!config.allowWalmartWrites) throw new Error("Las escrituras reales están bloqueadas. Configura ALLOW_WALMART_WRITES=true.");
     if (input.trigger !== "scheduled" && !input.productionConfirmed) {
-      throw new Error("La actualización real requiere confirmar expresamente el SKU.");
+      throw new Error("La actualización real requiere confirmar expresamente la operación.");
     }
   }
 
@@ -43,7 +148,7 @@ export async function executeSync(input: ExecuteSyncInput) {
     .values({ mode: input.mode, trigger: input.trigger || "manual", status: "running" })
     .$returningId();
   const startedAt = Date.now();
-  const counters = { total: 0, updated: 0, unchanged: 0, failed: 0 };
+  const counters: Counters = { total: 0, updated: 0, unchanged: 0, failed: 0 };
 
   try {
     if (input.mode !== "simulation" && !settings.bsaleOfficeId) {
@@ -58,72 +163,77 @@ export async function executeSync(input: ExecuteSyncInput) {
       throw new Error(`El SKU ${input.requestedSku} no aparece en el stock de Bsale para la sucursal configurada.`);
     }
 
-    for (const stock of selected) {
-      const targetStock = calculateTargetStock(stock.available, settings.safetyStock);
-      let walmartStock: number | null = null;
-      try {
-        if (input.mode === "simulation") {
-          walmartStock = demoWalmartAmount(stock.sku);
-          if (walmartStock === null) {
-            throw Object.assign(new Error("El SKU no existe en el catálogo simulado de Walmart. Revisa la equivalencia de SKU."), {
-              code: "WALMART_SKU_NOT_FOUND",
-            });
+    let resultMessage: string | undefined;
+    if (input.mode !== "simulation" && !input.requestedSku && selected.length > 0) {
+      resultMessage = await executeBulkSync({ mode: input.mode, selected, settings, runId, counters, db });
+    } else {
+      for (const stock of selected) {
+        const targetStock = calculateTargetStock(stock.available, settings.safetyStock);
+        let walmartStock: number | null = null;
+        try {
+          if (input.mode === "simulation") {
+            walmartStock = demoWalmartAmount(stock.sku);
+            if (walmartStock === null) {
+              throw Object.assign(new Error("El SKU no existe en el catálogo simulado de Walmart. Revisa la equivalencia de SKU."), {
+                code: "WALMART_SKU_NOT_FOUND",
+              });
+            }
+          } else {
+            const current = await getWalmartInventory(input.mode, stock.sku, settings.walmartShipNode || undefined);
+            walmartStock = current.amount;
+            if (walmartStock === null || !Number.isFinite(walmartStock)) {
+              throw new Error("Walmart respondió sin una cantidad de inventario reconocible.");
+            }
           }
-        } else {
-          const current = await getWalmartInventory(input.mode, stock.sku, settings.walmartShipNode || undefined);
-          walmartStock = current.amount;
-          if (walmartStock === null || !Number.isFinite(walmartStock)) {
-            throw new Error("Walmart respondió sin una cantidad de inventario reconocible.");
-          }
-        }
 
-        if (walmartStock === targetStock) {
-          counters.unchanged += 1;
+          if (walmartStock === targetStock) {
+            counters.unchanged += 1;
+            await db.insert(syncItems).values({
+              runId,
+              sku: stock.sku,
+              bsaleStock: stock.available,
+              walmartStock,
+              targetStock,
+              status: "unchanged",
+            });
+            continue;
+          }
+
+          let correlationId: string | undefined;
+          if (input.mode !== "simulation") {
+            const updated = await updateWalmartInventory(
+              input.mode,
+              stock.sku,
+              targetStock,
+              settings.walmartShipNode || undefined,
+            );
+            correlationId = updated.correlationId;
+          }
+          counters.updated += 1;
           await db.insert(syncItems).values({
             runId,
             sku: stock.sku,
             bsaleStock: stock.available,
             walmartStock,
             targetStock,
-            status: "unchanged",
+            status: input.mode === "simulation" ? "simulated" : "updated",
+            correlationId,
           });
-          continue;
-        }
-
-        let correlationId: string | undefined;
-        if (input.mode !== "simulation") {
-          const updated = await updateWalmartInventory(
-            input.mode,
-            stock.sku,
+        } catch (error) {
+          counters.failed += 1;
+          const typedError = error as { code?: string; status?: number; correlationId?: string };
+          await db.insert(syncItems).values({
+            runId,
+            sku: stock.sku,
+            bsaleStock: stock.available,
+            walmartStock,
             targetStock,
-            settings.walmartShipNode || undefined,
-          );
-          correlationId = updated.correlationId;
+            status: "failed",
+            errorCode: typedError.code || (typedError.status ? `HTTP_${typedError.status}` : "SYNC_ITEM_ERROR"),
+            errorMessage: safeErrorMessage(error),
+            correlationId: typedError.correlationId,
+          });
         }
-        counters.updated += 1;
-        await db.insert(syncItems).values({
-          runId,
-          sku: stock.sku,
-          bsaleStock: stock.available,
-          walmartStock,
-          targetStock,
-          status: input.mode === "simulation" ? "simulated" : "updated",
-          correlationId,
-        });
-      } catch (error) {
-        counters.failed += 1;
-        const typedError = error as { code?: string; status?: number; correlationId?: string };
-        await db.insert(syncItems).values({
-          runId,
-          sku: stock.sku,
-          bsaleStock: stock.available,
-          walmartStock,
-          targetStock,
-          status: "failed",
-          errorCode: typedError.code || (typedError.status ? `HTTP_${typedError.status}` : "SYNC_ITEM_ERROR"),
-          errorMessage: safeErrorMessage(error),
-          correlationId: typedError.correlationId,
-        });
       }
     }
 
@@ -131,9 +241,10 @@ export async function executeSync(input: ExecuteSyncInput) {
     const message =
       counters.total === 0
         ? "No hay SKU que coincidan con los filtros configurados."
-        : input.mode === "simulation"
-          ? `Simulación terminada: ${counters.updated} cambio(s) calculado(s), sin escribir en Walmart.`
-          : `Sincronización terminada: ${counters.updated} SKU actualizados y ${counters.failed} fallidos.`;
+        : resultMessage ||
+          (input.mode === "simulation"
+            ? `Simulación terminada: ${counters.updated} cambio(s) calculado(s), sin escribir en Walmart.`
+            : `Sincronización terminada: ${counters.updated} SKU actualizados, ${counters.unchanged} sin cambios y ${counters.failed} fallidos.`);
     await db
       .update(syncRuns)
       .set({ ...counters, status, message, durationMs: Date.now() - startedAt, finishedAt: new Date() })

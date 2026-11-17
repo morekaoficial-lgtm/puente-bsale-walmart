@@ -9,7 +9,7 @@ const labels: Record<Status, string> = {
   warning: "Con observaciones",
   error: "Fallida",
   simulated: "Cambio simulado",
-  updated: "Actualizado",
+  updated: "Cambio enviado",
   unchanged: "Sin cambios",
   failed: "Falló",
   skipped: "Omitido",

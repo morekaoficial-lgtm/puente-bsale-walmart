@@ -32,7 +32,7 @@ export const integrationRouter = createRouter({
   }),
 
   runItems: publicQuery.input(z.object({ runId: z.number().int().positive() })).query(async ({ input }) => {
-    return getDb().select().from(syncItems).where(eq(syncItems.runId, input.runId)).orderBy(desc(syncItems.id)).limit(500);
+    return getDb().select().from(syncItems).where(eq(syncItems.runId, input.runId)).orderBy(desc(syncItems.id)).limit(5000);
   }),
 
   updateSettings: publicQuery
@@ -72,8 +72,11 @@ export const integrationRouter = createRouter({
       }),
     )
     .mutation(async ({ input }) => {
-      if (input.mode === "production" && (!input.sku || input.productionConfirmation !== `ACTUALIZAR ${input.sku}`)) {
-        throw new Error("Para producción escribe exactamente: ACTUALIZAR <SKU>");
+      if (input.mode === "production") {
+        const expected = input.sku ? `ACTUALIZAR ${input.sku}` : "ACTUALIZAR CATÁLOGO";
+        if (input.productionConfirmation !== expected) {
+          throw new Error(`Para producción escribe exactamente: ${expected}`);
+        }
       }
       return executeSync({
         mode: input.mode,

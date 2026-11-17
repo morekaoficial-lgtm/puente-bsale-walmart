@@ -1,10 +1,20 @@
 import { getIntegrationConfig, type SyncMode } from "./config";
 
 export type WalmartInventory = { sku: string; amount: number | null; raw?: unknown };
+export type WalmartInventoryNode = { shipNode?: string; amount: number | null };
+export type WalmartCatalogInventory = { sku: string; nodes: WalmartInventoryNode[] };
+export type WalmartBulkItem = { sku: string; amount: number };
+
+type RealMode = Exclude<SyncMode, "simulation">;
+type WalmartRequestOptions = {
+  method?: "GET" | "PUT" | "POST";
+  body?: unknown;
+  correlationId: string;
+};
 
 let cachedToken: { key: string; value: string; expiresAt: number } | null = null;
 
-function baseUrl(mode: Exclude<SyncMode, "simulation">): string {
+function baseUrl(mode: RealMode): string {
   return mode === "sandbox" ? "https://sandbox.walmartapis.com" : "https://marketplace.walmartapis.com";
 }
 
@@ -18,7 +28,7 @@ async function parseResponse(response: Response): Promise<any> {
   }
 }
 
-async function getAccessToken(mode: Exclude<SyncMode, "simulation">): Promise<string> {
+async function getAccessToken(mode: RealMode): Promise<string> {
   const config = getIntegrationConfig();
   const cacheKey = `${mode}:${config.walmartClientId}`;
   if (cachedToken?.key === cacheKey && cachedToken.expiresAt > Date.now() + 60_000) return cachedToken.value;
@@ -53,11 +63,18 @@ async function getAccessToken(mode: Exclude<SyncMode, "simulation">): Promise<st
   return cachedToken.value;
 }
 
-async function walmartRequest(
-  mode: Exclude<SyncMode, "simulation">,
-  path: string,
-  options: { method?: "GET" | "PUT"; body?: unknown; correlationId: string },
-): Promise<any> {
+function retryDelayMs(response: Response, attempt: number): number {
+  const retryAfter = response.headers.get("Retry-After");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, 60_000);
+    const date = Date.parse(retryAfter);
+    if (Number.isFinite(date)) return Math.min(Math.max(0, date - Date.now()), 60_000);
+  }
+  return Math.min(1000 * 2 ** attempt, 8000);
+}
+
+async function walmartRequest(mode: RealMode, path: string, options: WalmartRequestOptions): Promise<any> {
   const config = getIntegrationConfig();
   const token = await getAccessToken(mode);
   const basic = Buffer.from(`${config.walmartClientId}:${config.walmartClientSecret}`).toString("base64");
@@ -70,20 +87,29 @@ async function walmartRequest(
     Accept: "application/json",
   };
   if (config.walmartChannelType) headers["WM_CONSUMER.CHANNEL.TYPE"] = config.walmartChannelType;
-  if (options.body !== undefined) headers["Content-Type"] = "application/json";
-  const response = await fetch(`${baseUrl(mode)}${path}`, {
-    method: options.method || "GET",
-    headers,
-    body: options.body === undefined ? undefined : JSON.stringify(options.body),
-    signal: AbortSignal.timeout(25_000),
-  });
-  const result = await parseResponse(response);
-  if (!response.ok) {
-    const error = new Error(`Walmart respondió HTTP ${response.status}: ${JSON.stringify(result).slice(0, 500)}`) as Error & {
+  const isForm = typeof FormData !== "undefined" && options.body instanceof FormData;
+  if (options.body !== undefined && !isForm) headers["Content-Type"] = "application/json";
+
+  let response: Response | null = null;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const currentResponse = await fetch(`${baseUrl(mode)}${path}`, {
+      method: options.method || "GET",
+      headers,
+      body: options.body === undefined ? undefined : isForm ? (options.body as FormData) : JSON.stringify(options.body),
+      signal: AbortSignal.timeout(25_000),
+    });
+    response = currentResponse;
+    if (![408, 429, 500, 502, 503, 504].includes(currentResponse.status) || attempt === 2) break;
+    await new Promise((resolve) => setTimeout(resolve, retryDelayMs(currentResponse, attempt)));
+  }
+
+  const result = await parseResponse(response!);
+  if (!response!.ok) {
+    const error = new Error(`Walmart respondió HTTP ${response!.status}: ${JSON.stringify(result).slice(0, 500)}`) as Error & {
       status?: number;
       correlationId?: string;
     };
-    error.status = response.status;
+    error.status = response!.status;
     error.correlationId = options.correlationId;
     throw error;
   }
@@ -102,8 +128,13 @@ function readAmount(result: any): number | null {
   return value === undefined ? null : Number(value);
 }
 
+function readNodeAmount(node: any): number | null {
+  const value = node?.inputQty?.amount ?? node?.quantity?.amount;
+  return value === undefined || value === null ? null : Number(value);
+}
+
 export async function getWalmartInventory(
-  mode: Exclude<SyncMode, "simulation">,
+  mode: RealMode,
   sku: string,
   shipNode?: string,
 ): Promise<WalmartInventory> {
@@ -114,8 +145,46 @@ export async function getWalmartInventory(
   return { sku, amount: readAmount(result), raw: result };
 }
 
+export async function getWalmartInventoryCatalog(mode: RealMode): Promise<Map<string, WalmartCatalogInventory>> {
+  const catalog = new Map<string, WalmartCatalogInventory>();
+  const usedCursors = new Set<string>();
+  let nextCursor = "";
+
+  do {
+    const params = new URLSearchParams({ limit: "50" });
+    if (nextCursor) params.set("nextCursor", nextCursor);
+    const result = await walmartRequest(mode, `/v3/inventories?${params.toString()}`, {
+      correlationId: crypto.randomUUID(),
+    });
+    const items = result?.inventories || result?.items || result?.payload?.inventories || [];
+    if (!Array.isArray(items)) throw new Error("Walmart devolvió un catálogo de inventario con formato no reconocido.");
+
+    for (const item of items) {
+      const sku = String(item?.sku || "").trim();
+      if (!sku) continue;
+      const rawNodes = item?.nodes || item?.inventory?.nodes || item?.inventories?.nodes || [];
+      const nodes: WalmartInventoryNode[] = Array.isArray(rawNodes)
+        ? rawNodes.map((node: any) => ({ shipNode: node?.shipNode?.toString(), amount: readNodeAmount(node) }))
+        : [];
+      if (nodes.length === 0) {
+        const amount = readAmount(item);
+        if (amount !== null) nodes.push({ amount });
+      }
+      catalog.set(sku, { sku, nodes });
+    }
+
+    nextCursor = String(result?.nextCursor || result?.meta?.nextCursor || "");
+    if (nextCursor && usedCursors.has(nextCursor)) {
+      throw new Error("Walmart repitió un cursor de paginación; se detuvo la lectura para evitar un ciclo.");
+    }
+    if (nextCursor) usedCursors.add(nextCursor);
+  } while (nextCursor);
+
+  return catalog;
+}
+
 export async function updateWalmartInventory(
-  mode: Exclude<SyncMode, "simulation">,
+  mode: RealMode,
   sku: string,
   amount: number,
   shipNode?: string,
@@ -129,6 +198,34 @@ export async function updateWalmartInventory(
     body: { sku, quantity: { unit: "EACH", amount } },
   });
   return { correlationId };
+}
+
+export async function updateWalmartInventoryBulk(
+  mode: RealMode,
+  items: WalmartBulkItem[],
+  shipNode?: string,
+): Promise<{ feedId: string; correlationId: string }> {
+  if (items.length === 0) throw new Error("No hay diferencias de inventario para enviar a Walmart.");
+  const payload = {
+    InventoryHeader: { version: "1.4" },
+    Inventory: items.map((item) => ({ sku: item.sku, quantity: { unit: "EACH", amount: item.amount } })),
+  };
+  const json = JSON.stringify(payload);
+  if (Buffer.byteLength(json, "utf8") > 4_500_000) {
+    throw new Error("El lote supera el tamaño seguro de 4,5 MB. Reduce el catálogo permitido antes de continuar.");
+  }
+  const form = new FormData();
+  form.append("file", new Blob([json], { type: "application/json" }), "BulkInventoryFeed.json");
+  const params = new URLSearchParams({ feedType: "inventory" });
+  if (shipNode) params.set("shipNode", shipNode);
+  const correlationId = crypto.randomUUID();
+  const result = await walmartRequest(mode, `/v3/feeds?${params.toString()}`, {
+    method: "POST",
+    correlationId,
+    body: form,
+  });
+  if (!result?.feedId) throw new Error("Walmart aceptó la llamada, pero no devolvió el identificador del feed.");
+  return { feedId: String(result.feedId), correlationId };
 }
 
 export async function testWalmartConnection(): Promise<{ detail: string }> {

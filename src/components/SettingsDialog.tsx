@@ -87,7 +87,7 @@ export function SettingsDialog({
                 className="field-control font-mono"
                 placeholder="Nodo predeterminado"
               />
-              <p className="field-help">Déjalo vacío si Walmart ya tiene uno asignado.</p>
+              <p className="field-help">Recomendado para lotes. Si hay varios nodos, es obligatorio para no comparar contra el nodo equivocado.</p>
             </div>
             <div className="space-y-2">
               <Label htmlFor="safety-stock">Stock de seguridad</Label>
@@ -128,7 +128,7 @@ export function SettingsDialog({
               className="field-control min-h-28 font-mono text-sm"
               placeholder={"SKU-001\nSKU-002\nSKU-003"}
             />
-            <p className="field-help">Un SKU por línea. Vacío significa todo el catálogo de la sucursal.</p>
+            <p className="field-help">Un SKU por línea. Vacío significa todo el catálogo de la sucursal. Usa primero una lista pequeña para el piloto.</p>
           </div>
 
           <label className="flex min-h-11 cursor-pointer items-start gap-3 rounded-md border border-[#34343e] p-4">
