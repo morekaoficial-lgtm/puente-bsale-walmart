@@ -37,7 +37,7 @@ Referencias oficiales:
 ## Funcionamiento con más de mil SKU
 
 1. Bsale se lee una sola vez por páginas y se calcula `max(0, floor(quantityAvailable - safetyStock))` para cada variante.
-2. Walmart se lee con `GET /v3/inventories?limit=50`, siguiendo `nextCursor` secuencialmente hasta terminar el catálogo.
+2. Walmart se lee con `GET /v3/inventories?limit=50`, siguiendo `nextCursor` secuencialmente hasta terminar el catálogo. Si esa lectura general responde 404, se activa una comparación individual con un máximo de tres consultas simultáneas y reintentos acotados.
 3. Se comparan las cantidades en memoria. Los SKU iguales se guardan como `unchanged` y no generan ninguna escritura.
 4. Solo las diferencias se incluyen en un feed JSON 1.4. Un SKU ausente, una cantidad inválida o un nodo ambiguo se registran como fallo y no se inventa un stock inicial.
 5. Walmart devuelve un `feedId` y procesa el lote de forma asíncrona. El estado “Cambio enviado” confirma la aceptación del feed, no que cada línea ya haya terminado; la siguiente ejecución vuelve a comparar el inventario real.

@@ -8,6 +8,7 @@ import {
   demoWalmartAmount,
   getWalmartInventory,
   getWalmartInventoryCatalog,
+  getWalmartInventoryCatalogForSkus,
   updateWalmartInventory,
   updateWalmartInventoryBulk,
 } from "./walmart";
@@ -40,8 +41,37 @@ async function executeBulkSync({
   db: Db;
 }): Promise<string> {
   const shipNode = settings.walmartShipNode || undefined;
-  const catalog = await getWalmartInventoryCatalog(mode);
-  const plans = planBulkInventory(selected, catalog, settings.safetyStock, shipNode);
+  let catalog;
+  let usedIndividualFallback = false;
+  const readFailures = new Map<string, unknown>();
+  try {
+    catalog = await getWalmartInventoryCatalog(mode);
+  } catch (error) {
+    if ((error as { status?: number }).status !== 404) throw error;
+    usedIndividualFallback = true;
+    const fallback = await getWalmartInventoryCatalogForSkus(
+      mode,
+      selected.map((stock) => stock.sku),
+      shipNode,
+    );
+    catalog = fallback.catalog;
+    for (const [sku, reason] of fallback.failures) readFailures.set(sku, reason);
+  }
+  const plans = planBulkInventory(selected, catalog, settings.safetyStock, shipNode).map((plan) => {
+    const reason = readFailures.get(plan.stock.sku);
+    if (!reason) return plan;
+    const typedError = reason as { code?: string; status?: number; correlationId?: string };
+    return {
+      ...plan,
+      status: "failed" as const,
+      errorCode: typedError.code || (typedError.status ? `HTTP_${typedError.status}` : "WALMART_READ_ERROR"),
+      errorMessage: safeErrorMessage(reason),
+      correlationId: typedError.correlationId,
+    };
+  });
+  const fallbackNote = usedIndividualFallback
+    ? " La lectura general no estuvo disponible; se comparó cada SKU individualmente."
+    : "";
   counters.total = plans.length;
 
   const unchanged = plans.filter((plan) => plan.status === "unchanged");
@@ -68,8 +98,8 @@ async function executeBulkSync({
 
   if (changes.length === 0) {
     return counters.failed === 0
-      ? `Sin escrituras: ${counters.unchanged} SKU ya coinciden entre Bsale y Walmart.`
-      : `No hay diferencias que enviar; ${counters.failed} SKU requieren revisión.`;
+      ? `Sin escrituras: ${counters.unchanged} SKU ya coinciden entre Bsale y Walmart.${fallbackNote}`
+      : `No hay diferencias que enviar; ${counters.failed} SKU requieren revisión.${fallbackNote}`;
   }
 
   try {
@@ -91,7 +121,7 @@ async function executeBulkSync({
         correlationId: feed.feedId,
       })),
     );
-    return `Feed ${feed.feedId} aceptado por Walmart: ${changes.length} cambio(s) enviados, ${counters.unchanged} sin cambios y ${counters.failed} fallidos.`;
+    return `Feed ${feed.feedId} aceptado por Walmart: ${changes.length} cambio(s) enviados, ${counters.unchanged} sin cambios y ${counters.failed} fallidos.${fallbackNote}`;
   } catch (error) {
     counters.failed += changes.length;
     const typedError = error as { code?: string; status?: number; correlationId?: string };
@@ -109,7 +139,7 @@ async function executeBulkSync({
         correlationId: typedError.correlationId,
       })),
     );
-    return `Walmart rechazó el lote de ${changes.length} cambio(s); no se confirmó ninguna actualización del feed.`;
+    return `Walmart rechazó el lote de ${changes.length} cambio(s); no se confirmó ninguna actualización del feed.${fallbackNote}`;
   }
 }
 

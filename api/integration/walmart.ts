@@ -145,6 +145,33 @@ export async function getWalmartInventory(
   return { sku, amount: readAmount(result), raw: result };
 }
 
+export async function getWalmartInventoryCatalogForSkus(
+  mode: RealMode,
+  skus: string[],
+  shipNode?: string,
+): Promise<{ catalog: Map<string, WalmartCatalogInventory>; failures: Map<string, unknown> }> {
+  const catalog = new Map<string, WalmartCatalogInventory>();
+  const failures = new Map<string, unknown>();
+  const pending = [...new Set(skus)];
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < pending.length) {
+      const sku = pending[cursor];
+      cursor += 1;
+      try {
+        const current = await getWalmartInventory(mode, sku, shipNode);
+        catalog.set(sku, { sku, nodes: [{ shipNode, amount: current.amount }] });
+      } catch (error) {
+        failures.set(sku, error);
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(3, pending.length) }, () => worker()));
+  return { catalog, failures };
+}
+
 export async function getWalmartInventoryCatalog(mode: RealMode): Promise<Map<string, WalmartCatalogInventory>> {
   const catalog = new Map<string, WalmartCatalogInventory>();
   const usedCursors = new Set<string>();

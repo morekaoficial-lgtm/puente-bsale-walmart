@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { getWalmartInventoryCatalog, updateWalmartInventory, updateWalmartInventoryBulk } from "./walmart";
+import {
+  getWalmartInventoryCatalog,
+  getWalmartInventoryCatalogForSkus,
+  updateWalmartInventory,
+  updateWalmartInventoryBulk,
+} from "./walmart";
 
 describe("Walmart Marketplace", () => {
   afterEach(() => {
@@ -119,5 +124,25 @@ describe("Walmart Marketplace", () => {
 
     await getWalmartInventoryCatalog("sandbox");
     expect(inventoryCalls).toBe(2);
+  });
+
+  it("conserva cantidades y errores por SKU en la lectura individual de respaldo", async () => {
+    vi.stubEnv("WALMART_CLIENT_ID", "cliente-respaldo");
+    vi.stubEnv("WALMART_CLIENT_SECRET", "secreto-prueba");
+    vi.stubEnv("WALMART_MARKET", "mx");
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      const value = String(url);
+      if (value.endsWith("/v3/token")) {
+        return new Response(JSON.stringify({ access_token: "token-respaldo", expires_in: 900 }), { status: 200 });
+      }
+      if (value.includes("sku=FALLA")) return new Response(JSON.stringify({ message: "no disponible" }), { status: 404 });
+      return new Response(JSON.stringify({ sku: "SKU-OK", quantity: { unit: "EACH", amount: 5 } }), { status: 200 });
+    }));
+
+    const result = await getWalmartInventoryCatalogForSkus("production", ["SKU-OK", "FALLA", "SKU-OK"], "NODE-1");
+
+    expect(result.catalog.get("SKU-OK")?.nodes[0]).toEqual({ shipNode: "NODE-1", amount: 5 });
+    expect(result.catalog.has("FALLA")).toBe(false);
+    expect((result.failures.get("FALLA") as { status?: number }).status).toBe(404);
   });
 });
